@@ -1,7 +1,7 @@
 """
 Runpod Serverless Handler for Video Rendering with FFmpeg
 GPU-accelerated video encoding using NVENC
-Supports both base64 data and Google Drive URL downloads
+Supports Google Drive download and upload
 """
 
 import runpod
@@ -13,6 +13,16 @@ import json
 import urllib.request
 import ssl
 from pathlib import Path
+
+# Google Drive API
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GOOGLE_API_AVAILABLE = True
+except ImportError:
+    GOOGLE_API_AVAILABLE = False
+    print("[Handler] Google API not available - upload to Drive disabled")
 
 def download_base64_file(base64_data: str, filepath: str) -> None:
     """Base64 데이터를 파일로 저장"""
@@ -36,7 +46,6 @@ def download_from_url(url: str, filepath: str) -> bool:
             if url.startswith('gdrive:'):
                 file_id = url.replace('gdrive:', '')
             else:
-                # URL에서 file_id 추출
                 file_id = url
 
             # Google Drive direct download URL
@@ -50,17 +59,59 @@ def download_from_url(url: str, filepath: str) -> bool:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
 
-        with urllib.request.urlopen(req, context=ssl_context, timeout=60) as response:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=120) as response:
             with open(filepath, 'wb') as f:
                 f.write(response.read())
 
         file_size = os.path.getsize(filepath)
         print(f"[Handler] Downloaded: {filepath} ({file_size} bytes)")
-        return file_size > 100  # 최소 100바이트 이상
+        return file_size > 100
 
     except Exception as e:
         print(f"[Handler] Download failed: {e}")
         return False
+
+def upload_to_google_drive(filepath: str, folder_id: str, credentials_json: str) -> dict:
+    """Google Drive에 파일 업로드"""
+    if not GOOGLE_API_AVAILABLE:
+        return {'error': 'Google API not available'}
+
+    try:
+        # 서비스 계정 인증
+        creds_dict = json.loads(credentials_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=['https://www.googleapis.com/auth/drive.file']
+        )
+
+        service = build('drive', 'v3', credentials=credentials)
+
+        # 파일 메타데이터
+        file_name = os.path.basename(filepath)
+        file_metadata = {
+            'name': file_name,
+            'parents': [folder_id] if folder_id else []
+        }
+
+        # 업로드
+        media = MediaFileUpload(filepath, mimetype='video/mp4', resumable=True)
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink, webContentLink'
+        ).execute()
+
+        print(f"[Handler] Uploaded to Drive: {file.get('id')}")
+
+        return {
+            'fileId': file.get('id'),
+            'webViewLink': file.get('webViewLink'),
+            'webContentLink': file.get('webContentLink'),
+        }
+
+    except Exception as e:
+        print(f"[Handler] Drive upload failed: {e}")
+        return {'error': str(e)}
 
 def encode_file_to_base64(filepath: str) -> str:
     """파일을 base64로 인코딩"""
@@ -122,6 +173,11 @@ def render_video(job_input: dict) -> dict:
     subtitle_style = job_input.get('subtitleStyle', {})
     bgm = job_input.get('bgm')
 
+    # Google Drive 업로드 설정
+    upload_to_drive = job_input.get('uploadToDrive', False)
+    drive_folder_id = job_input.get('driveFolderId', '')
+    drive_credentials = job_input.get('driveCredentials', '')
+
     if not scenes:
         return {'error': '씬 데이터가 필요합니다.'}
 
@@ -136,6 +192,7 @@ def render_video(job_input: dict) -> dict:
     fps = 30
 
     print(f"[Handler] 렌더링 시작: {len(scenes)}개 씬, 해상도: {resolution} ({width}x{height})")
+    print(f"[Handler] Drive 업로드: {upload_to_drive}, 폴더: {drive_folder_id[:20] if drive_folder_id else 'N/A'}...")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -174,9 +231,8 @@ def render_video(job_input: dict) -> dict:
                     download_base64_file(scene['imageData'], str(media_file))
                     is_video = False
                 elif scene.get('imageUrl'):
-                    # Google Drive file ID인 경우 (gdrive: prefix)
                     image_url = scene['imageUrl']
-                    ext = 'jpg'  # 기본 확장자
+                    ext = 'jpg'
                     media_file = temp_path / f"image_{i}.{ext}"
                     if not download_from_url(image_url, str(media_file)):
                         return {'error': f'씬 {i+1} 이미지 다운로드 실패'}
@@ -215,8 +271,8 @@ def render_video(job_input: dict) -> dict:
                     '-i', str(media_file),
                     '-vf', f'fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black',
                     '-frames:v', str(exact_frames),
-                    '-c:v', 'h264_nvenc',  # GPU 인코딩
-                    '-preset', 'p4',        # 빠른 프리셋
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p4',
                     '-rc', 'vbr',
                     '-cq', '23',
                     '-pix_fmt', 'yuv420p',
@@ -243,7 +299,6 @@ def render_video(job_input: dict) -> dict:
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                # NVENC 실패 시 CPU 폴백
                 print(f"[Handler] NVENC 실패, CPU 폴백 사용")
                 if is_video:
                     cmd = [
@@ -311,7 +366,6 @@ def render_video(job_input: dict) -> dict:
                 for j, af in enumerate(audio_files):
                     f.write(f"file '{af}'\n")
                     if j < len(audio_files) - 1 and scene_gap_duration > 0:
-                        # 무음 구간 생성
                         silence = temp_path / f'silence_{j}.mp3'
                         subprocess.run([
                             'ffmpeg', '-y',
@@ -334,7 +388,7 @@ def render_video(job_input: dict) -> dict:
                 str(merged_audio)
             ], capture_output=True)
 
-        # 4. BGM 믹싱 (있는 경우)
+        # 4. BGM 믹싱
         if bgm and merged_audio:
             bgm_file = temp_path / 'bgm.mp3'
             bgm_loaded = False
@@ -375,7 +429,7 @@ def render_video(job_input: dict) -> dict:
                 if mixed_audio.exists():
                     merged_audio = mixed_audio
 
-        # 5. 자막 생성 (필요한 경우)
+        # 5. 자막 생성
         subtitle_file = None
         if show_subtitle:
             scenes_with_subtitles = [s for s in scenes if s.get('subtitle')]
@@ -391,7 +445,6 @@ def render_video(job_input: dict) -> dict:
             cmd.extend(['-i', str(merged_audio)])
 
         if subtitle_file and subtitle_file.exists():
-            # 자막 스타일 구성
             style_parts = [
                 f"FontName={subtitle_style.get('fontName', 'Arial')}",
                 f"FontSize={subtitle_style.get('fontSize', 24)}",
@@ -405,7 +458,6 @@ def render_video(job_input: dict) -> dict:
             ]
             style_str = ','.join(style_parts)
 
-            # GPU 디코딩 + CPU 자막 렌더링 + GPU 인코딩
             cmd.extend([
                 '-vf', f"subtitles='{subtitle_file}':force_style='{style_str}'",
                 '-c:v', 'h264_nvenc',
@@ -427,7 +479,6 @@ def render_video(job_input: dict) -> dict:
         if result.returncode != 0 and 'nvenc' in ' '.join(cmd).lower():
             cmd = [c.replace('h264_nvenc', 'libx264').replace('p4', 'ultrafast') for c in cmd]
             cmd = [c for c in cmd if c not in ['-rc', 'vbr', '-cq']]
-            # -cq 값 제거
             new_cmd = []
             skip_next = False
             for c in cmd:
@@ -441,7 +492,6 @@ def render_video(job_input: dict) -> dict:
                     skip_next = True
                     continue
                 new_cmd.append(c)
-            # -crf 추가
             if '-c:v' in new_cmd:
                 idx = new_cmd.index('-c:v')
                 new_cmd.insert(idx + 2, '-crf')
@@ -451,7 +501,7 @@ def render_video(job_input: dict) -> dict:
         if result.returncode != 0:
             return {'error': f'최종 렌더링 실패: {result.stderr[:500]}'}
 
-        # 7. 결과 반환
+        # 7. 결과 처리
         if not output_file.exists():
             return {'error': '출력 파일이 생성되지 않았습니다.'}
 
@@ -460,17 +510,50 @@ def render_video(job_input: dict) -> dict:
 
         print(f"[Handler] 렌더링 완료: {duration}초, {round(file_size / (1024 * 1024), 2)}MB")
 
-        # base64로 인코딩하여 반환
-        video_base64 = encode_file_to_base64(str(output_file))
+        # Google Drive 업로드
+        if upload_to_drive and drive_folder_id and drive_credentials:
+            print(f"[Handler] Google Drive 업로드 시작...")
+            upload_result = upload_to_google_drive(
+                str(output_file),
+                drive_folder_id,
+                drive_credentials
+            )
 
-        return {
-            'success': True,
-            'videoData': f'data:video/{output_format};base64,{video_base64}',
-            'duration': duration,
-            'sizeMB': round(file_size / (1024 * 1024), 2),
-            'actualSegmentDurations': actual_durations,
-            'actualGapDuration': scene_gap_duration
-        }
+            if 'error' in upload_result:
+                print(f"[Handler] Drive 업로드 실패: {upload_result['error']}")
+                # 업로드 실패 시 base64 폴백
+            else:
+                print(f"[Handler] Drive 업로드 성공: {upload_result['fileId']}")
+                return {
+                    'success': True,
+                    'uploadedToDrive': True,
+                    'driveFileId': upload_result['fileId'],
+                    'driveViewLink': upload_result.get('webViewLink'),
+                    'driveDownloadLink': upload_result.get('webContentLink'),
+                    'duration': duration,
+                    'sizeMB': round(file_size / (1024 * 1024), 2),
+                    'actualSegmentDurations': actual_durations,
+                    'actualGapDuration': scene_gap_duration
+                }
+
+        # base64로 인코딩하여 반환 (파일이 작은 경우만)
+        if file_size < 100 * 1024 * 1024:  # 100MB 미만만 base64
+            video_base64 = encode_file_to_base64(str(output_file))
+            return {
+                'success': True,
+                'videoData': f'data:video/{output_format};base64,{video_base64}',
+                'duration': duration,
+                'sizeMB': round(file_size / (1024 * 1024), 2),
+                'actualSegmentDurations': actual_durations,
+                'actualGapDuration': scene_gap_duration
+            }
+        else:
+            return {
+                'success': True,
+                'error': f'파일이 너무 큽니다 ({round(file_size / (1024 * 1024), 2)}MB). Google Drive 업로드를 활성화하세요.',
+                'duration': duration,
+                'sizeMB': round(file_size / (1024 * 1024), 2),
+            }
 
 def handler(job):
     """Runpod 핸들러 진입점"""
