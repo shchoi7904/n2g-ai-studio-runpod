@@ -1,6 +1,7 @@
 """
 Runpod Serverless Handler for Video Rendering with FFmpeg
 GPU-accelerated video encoding using NVENC
+Supports both base64 data and Google Drive URL downloads
 """
 
 import runpod
@@ -9,6 +10,8 @@ import base64
 import os
 import tempfile
 import json
+import urllib.request
+import ssl
 from pathlib import Path
 
 def download_base64_file(base64_data: str, filepath: str) -> None:
@@ -18,6 +21,46 @@ def download_base64_file(base64_data: str, filepath: str) -> None:
 
     with open(filepath, 'wb') as f:
         f.write(base64.b64decode(base64_data))
+
+def download_from_url(url: str, filepath: str) -> bool:
+    """URL에서 파일 다운로드 (Google Drive 지원)"""
+    try:
+        # SSL 검증 비활성화 (Google Drive 다운로드용)
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        # Google Drive direct download URL 처리
+        if 'drive.google.com' in url or url.startswith('gdrive:'):
+            # gdrive:FILE_ID 형식 처리
+            if url.startswith('gdrive:'):
+                file_id = url.replace('gdrive:', '')
+            else:
+                # URL에서 file_id 추출
+                file_id = url
+
+            # Google Drive direct download URL
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        else:
+            download_url = url
+
+        print(f"[Handler] Downloading from: {download_url[:80]}...")
+
+        req = urllib.request.Request(download_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+        with urllib.request.urlopen(req, context=ssl_context, timeout=60) as response:
+            with open(filepath, 'wb') as f:
+                f.write(response.read())
+
+        file_size = os.path.getsize(filepath)
+        print(f"[Handler] Downloaded: {filepath} ({file_size} bytes)")
+        return file_size > 100  # 최소 100바이트 이상
+
+    except Exception as e:
+        print(f"[Handler] Download failed: {e}")
+        return False
 
 def encode_file_to_base64(filepath: str) -> str:
     """파일을 base64로 인코딩"""
@@ -92,6 +135,8 @@ def render_video(job_input: dict) -> dict:
     width, height = res_map.get(resolution, (1920, 1080))
     fps = 30
 
+    print(f"[Handler] 렌더링 시작: {len(scenes)}개 씬, 해상도: {resolution} ({width}x{height})")
+
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         segment_files = []
@@ -104,25 +149,55 @@ def render_video(job_input: dict) -> dict:
             gap_to_include = 0 if is_last else scene_gap_duration
             end_buffer = 0.3 if is_last else 0
 
-            # 미디어 파일 저장
+            print(f"[Handler] 씬 {i+1}/{len(scenes)} 처리 중...")
+
+            # 미디어 파일 저장 (URL 또는 base64)
+            media_file = None
+            is_video = False
+
+            # 비디오 처리
             if scene.get('videoData'):
                 media_file = temp_path / f"video_{i}.mp4"
                 download_base64_file(scene['videoData'], str(media_file))
                 is_video = True
-            elif scene.get('imageData'):
-                media_file = temp_path / f"image_{i}.png"
-                download_base64_file(scene['imageData'], str(media_file))
-                is_video = False
-            else:
-                return {'error': f'씬 {i+1}에 미디어 데이터가 없습니다.'}
+            elif scene.get('videoUrl'):
+                media_file = temp_path / f"video_{i}.mp4"
+                if download_from_url(scene['videoUrl'], str(media_file)):
+                    is_video = True
+                else:
+                    media_file = None
+
+            # 이미지 처리 (비디오가 없는 경우)
+            if not media_file:
+                if scene.get('imageData'):
+                    media_file = temp_path / f"image_{i}.png"
+                    download_base64_file(scene['imageData'], str(media_file))
+                    is_video = False
+                elif scene.get('imageUrl'):
+                    # Google Drive file ID인 경우 (gdrive: prefix)
+                    image_url = scene['imageUrl']
+                    ext = 'jpg'  # 기본 확장자
+                    media_file = temp_path / f"image_{i}.{ext}"
+                    if not download_from_url(image_url, str(media_file)):
+                        return {'error': f'씬 {i+1} 이미지 다운로드 실패'}
+                    is_video = False
+                else:
+                    return {'error': f'씬 {i+1}에 미디어 데이터가 없습니다.'}
 
             # 오디오 저장 및 실제 길이 측정
             audio_duration = scene.get('duration', 3)
+            audio_file = None
+
             if scene.get('audioData'):
                 audio_file = temp_path / f"audio_{i}.mp3"
                 download_base64_file(scene['audioData'], str(audio_file))
-                audio_files.append(str(audio_file))
+            elif scene.get('audioUrl'):
+                audio_file = temp_path / f"audio_{i}.mp3"
+                if not download_from_url(scene['audioUrl'], str(audio_file)):
+                    audio_file = None
 
+            if audio_file and audio_file.exists():
+                audio_files.append(str(audio_file))
                 measured = get_video_duration(str(audio_file))
                 if measured > 0:
                     audio_duration = measured
@@ -169,9 +244,7 @@ def render_video(job_input: dict) -> dict:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 # NVENC 실패 시 CPU 폴백
-                cmd = [c.replace('h264_nvenc', 'libx264').replace('-preset', '-preset').replace('p4', 'ultrafast').replace('-rc', '-crf').replace('vbr', '').replace('-cq', '') for c in cmd if c and c != 'vbr']
-                cmd = [c for c in cmd if c]  # 빈 문자열 제거
-                # CPU 폴백 명령 재구성
+                print(f"[Handler] NVENC 실패, CPU 폴백 사용")
                 if is_video:
                     cmd = [
                         'ffmpeg', '-y',
@@ -211,6 +284,8 @@ def render_video(job_input: dict) -> dict:
                 'sceneKey': scene.get('sceneKey', f'scene_{i}'),
                 'duration': audio_duration
             })
+
+        print(f"[Handler] 모든 세그먼트 생성 완료: {len(segment_files)}개")
 
         # 2. 세그먼트 병합
         concat_file = temp_path / 'concat.txt'
@@ -260,38 +335,45 @@ def render_video(job_input: dict) -> dict:
             ], capture_output=True)
 
         # 4. BGM 믹싱 (있는 경우)
-        if bgm and bgm.get('data') and merged_audio:
+        if bgm and merged_audio:
             bgm_file = temp_path / 'bgm.mp3'
-            download_base64_file(bgm['data'], str(bgm_file))
+            bgm_loaded = False
 
-            total_duration = get_video_duration(str(merged_video))
-            bgm_volume = bgm.get('volume', 30) / 100
-            fade_in = bgm.get('fadeIn', 2)
-            fade_out = bgm.get('fadeOut', 3)
+            if bgm.get('data'):
+                download_base64_file(bgm['data'], str(bgm_file))
+                bgm_loaded = True
+            elif bgm.get('url'):
+                bgm_loaded = download_from_url(bgm['url'], str(bgm_file))
 
-            mixed_audio = temp_path / 'mixed_audio.mp3'
-            fade_out_start = max(0, total_duration - fade_out)
+            if bgm_loaded and bgm_file.exists():
+                total_duration = get_video_duration(str(merged_video))
+                bgm_volume = bgm.get('volume', 30) / 100
+                fade_in = bgm.get('fadeIn', 2)
+                fade_out = bgm.get('fadeOut', 3)
 
-            filter_complex = f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{total_duration},volume={bgm_volume}"
-            if fade_in > 0:
-                filter_complex += f",afade=t=in:st=0:d={fade_in}"
-            if fade_out > 0:
-                filter_complex += f",afade=t=out:st={fade_out_start}:d={fade_out}"
-            filter_complex += "[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[out]"
+                mixed_audio = temp_path / 'mixed_audio.mp3'
+                fade_out_start = max(0, total_duration - fade_out)
 
-            subprocess.run([
-                'ffmpeg', '-y',
-                '-i', str(merged_audio),
-                '-i', str(bgm_file),
-                '-filter_complex', filter_complex,
-                '-map', '[out]',
-                '-c:a', 'libmp3lame',
-                '-b:a', '192k',
-                str(mixed_audio)
-            ], capture_output=True)
+                filter_complex = f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{total_duration},volume={bgm_volume}"
+                if fade_in > 0:
+                    filter_complex += f",afade=t=in:st=0:d={fade_in}"
+                if fade_out > 0:
+                    filter_complex += f",afade=t=out:st={fade_out_start}:d={fade_out}"
+                filter_complex += "[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[out]"
 
-            if mixed_audio.exists():
-                merged_audio = mixed_audio
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-i', str(merged_audio),
+                    '-i', str(bgm_file),
+                    '-filter_complex', filter_complex,
+                    '-map', '[out]',
+                    '-c:a', 'libmp3lame',
+                    '-b:a', '192k',
+                    str(mixed_audio)
+                ], capture_output=True)
+
+                if mixed_audio.exists():
+                    merged_audio = mixed_audio
 
         # 5. 자막 생성 (필요한 경우)
         subtitle_file = None
@@ -376,6 +458,8 @@ def render_video(job_input: dict) -> dict:
         file_size = output_file.stat().st_size
         duration = get_video_duration(str(output_file))
 
+        print(f"[Handler] 렌더링 완료: {duration}초, {round(file_size / (1024 * 1024), 2)}MB")
+
         # base64로 인코딩하여 반환
         video_base64 = encode_file_to_base64(str(output_file))
 
@@ -396,6 +480,7 @@ def handler(job):
         result = render_video(job_input)
         return result
     except Exception as e:
-        return {'error': str(e)}
+        import traceback
+        return {'error': str(e), 'traceback': traceback.format_exc()}
 
 runpod.serverless.start({'handler': handler})
