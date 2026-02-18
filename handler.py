@@ -12,6 +12,7 @@ import tempfile
 import json
 import urllib.request
 import ssl
+import math
 from pathlib import Path
 
 # Google Drive API
@@ -71,8 +72,46 @@ def download_from_url(url: str, filepath: str) -> bool:
         print(f"[Handler] Download failed: {e}")
         return False
 
-def upload_to_google_drive(filepath: str, folder_id: str, credentials_json: str) -> dict:
-    """Google Drive에 파일 업로드"""
+def get_or_create_folder(service, folder_name: str, parent_id: str) -> str:
+    """폴더를 찾거나 없으면 생성"""
+    # 기존 폴더 검색
+    query = f"name='{folder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=query, fields='files(id, name)').execute()
+    files = results.get('files', [])
+
+    if files:
+        print(f"[Handler] Found existing folder: {folder_name} ({files[0]['id']})")
+        return files[0]['id']
+
+    # 폴더 생성
+    folder_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
+    }
+    folder = service.files().create(body=folder_metadata, fields='id').execute()
+    print(f"[Handler] Created folder: {folder_name} ({folder['id']})")
+    return folder['id']
+
+def get_folder_by_path(service, base_folder_id: str, path_parts: list) -> str:
+    """경로를 따라 폴더를 찾거나 생성 (예: ['채널명', '영상1', 'video'])"""
+    current_folder_id = base_folder_id
+
+    for part in path_parts:
+        if part:  # 빈 문자열 무시
+            current_folder_id = get_or_create_folder(service, part, current_folder_id)
+
+    return current_folder_id
+
+def upload_to_google_drive(filepath: str, folder_id: str, credentials_json: str, folder_path: list = None) -> dict:
+    """Google Drive에 파일 업로드
+
+    Args:
+        filepath: 업로드할 파일 경로
+        folder_id: 기본 폴더 ID (루트)
+        credentials_json: 서비스 계정 JSON
+        folder_path: 하위 폴더 경로 리스트 (예: ['채널명', '영상1', 'video'])
+    """
     if not GOOGLE_API_AVAILABLE:
         return {'error': 'Google API not available'}
 
@@ -81,16 +120,22 @@ def upload_to_google_drive(filepath: str, folder_id: str, credentials_json: str)
         creds_dict = json.loads(credentials_json)
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.file']
+            scopes=['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
         )
 
         service = build('drive', 'v3', credentials=credentials)
+
+        # 폴더 경로가 지정된 경우 해당 경로의 폴더 찾기/생성
+        target_folder_id = folder_id
+        if folder_path and len(folder_path) > 0:
+            print(f"[Handler] Finding/creating folder path: {'/'.join(folder_path)}")
+            target_folder_id = get_folder_by_path(service, folder_id, folder_path)
 
         # 파일 메타데이터
         file_name = os.path.basename(filepath)
         file_metadata = {
             'name': file_name,
-            'parents': [folder_id] if folder_id else []
+            'parents': [target_folder_id] if target_folder_id else []
         }
 
         # 업로드
@@ -101,12 +146,13 @@ def upload_to_google_drive(filepath: str, folder_id: str, credentials_json: str)
             fields='id, webViewLink, webContentLink'
         ).execute()
 
-        print(f"[Handler] Uploaded to Drive: {file.get('id')}")
+        print(f"[Handler] Uploaded to Drive: {file.get('id')} in folder {target_folder_id}")
 
         return {
             'fileId': file.get('id'),
             'webViewLink': file.get('webViewLink'),
             'webContentLink': file.get('webContentLink'),
+            'folderId': target_folder_id,
         }
 
     except Exception as e:
@@ -131,7 +177,7 @@ def get_video_duration(filepath: str) -> float:
     except:
         return 0
 
-def create_subtitle_file(scenes: list, filepath: str, gap_duration: float = 0, last_scene_buffer: float = 0.3) -> None:
+def create_subtitle_file(scenes: list, filepath: str, gap_duration: float = 0, last_scene_buffer: float = 1.0) -> None:
     """SRT 자막 파일 생성"""
     srt_content = ""
     start_time = 0
@@ -173,10 +219,11 @@ def render_video(job_input: dict) -> dict:
     subtitle_style = job_input.get('subtitleStyle', {})
     bgm = job_input.get('bgm')
 
-    # Google Drive 업로드 설정
-    upload_to_drive = job_input.get('uploadToDrive', False)
-    drive_folder_id = job_input.get('driveFolderId', '')
-    drive_credentials = job_input.get('driveCredentials', '')
+    # Google Drive 업로드 설정 (환경변수에서 읽기)
+    upload_to_drive = job_input.get('uploadToDrive', True)
+    drive_folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID', '')
+    drive_credentials = os.environ.get('GOOGLE_DRIVE_CREDENTIALS', '')
+    drive_folder_path = job_input.get('driveFolderPath', [])  # ['채널명', '영상1', 'video']
 
     if not scenes:
         return {'error': '씬 데이터가 필요합니다.'}
@@ -204,7 +251,7 @@ def render_video(job_input: dict) -> dict:
         for i, scene in enumerate(scenes):
             is_last = i == len(scenes) - 1
             gap_to_include = 0 if is_last else scene_gap_duration
-            end_buffer = 0.3 if is_last else 0
+            end_buffer = 1.0 if is_last else 0  # 마지막 씬에 1초 버퍼 추가 (오디오 잘림 방지)
 
             print(f"[Handler] 씬 {i+1}/{len(scenes)} 처리 중...")
 
@@ -259,7 +306,8 @@ def render_video(job_input: dict) -> dict:
                     audio_duration = measured
 
             target_duration = audio_duration + gap_to_include + end_buffer
-            exact_frames = int(target_duration * fps) + 1
+            # 프레임 수 계산: ceiling 사용하여 오디오가 잘리지 않도록
+            exact_frames = math.ceil(target_duration * fps) + 1
 
             segment_file = temp_path / f"segment_{i}.mp4"
 
@@ -435,7 +483,7 @@ def render_video(job_input: dict) -> dict:
             scenes_with_subtitles = [s for s in scenes if s.get('subtitle')]
             if scenes_with_subtitles:
                 subtitle_file = temp_path / 'subtitles.srt'
-                create_subtitle_file(scenes, str(subtitle_file), scene_gap_duration, 0.3)
+                create_subtitle_file(scenes, str(subtitle_file), scene_gap_duration, 1.0)
 
         # 6. 최종 영상 생성
         output_file = temp_path / f'output.{output_format}'
@@ -512,11 +560,12 @@ def render_video(job_input: dict) -> dict:
 
         # Google Drive 업로드
         if upload_to_drive and drive_folder_id and drive_credentials:
-            print(f"[Handler] Google Drive 업로드 시작...")
+            print(f"[Handler] Google Drive 업로드 시작... 폴더 경로: {drive_folder_path}")
             upload_result = upload_to_google_drive(
                 str(output_file),
                 drive_folder_id,
-                drive_credentials
+                drive_credentials,
+                drive_folder_path
             )
 
             if 'error' in upload_result:
